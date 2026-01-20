@@ -1,24 +1,25 @@
-# Onchain Credit Risk Engine
+# On-Chain Credit Risk Scoring API
 
-An explainable, on-chain wallet risk scoring and credit decision engine for DeFi protocols.
+A production-style FastAPI service that evaluates Ethereum wallet credit risk using on-chain behavior.
 
 ## What this does
-- Scores Ethereum wallets using real on-chain behavior
-- Assigns risk tiers (LOW / MEDIUM / HIGH)
-- Generates collateral & interest rate recommendations
-- Hard-gates new or risky wallets (DENY vs ALLOW)
-- Fully explainable (human-readable reasons & flags)
+- Scores wallets using ERC20 activity, transaction patterns, and counterparties
+- Produces a **risk tier**, **credit decision**, and **collateral recommendation**
+- Designed for DeFi lending protocols (Aave / Morpho-style policies)
 
-## API Endpoints
-- `/score` – Wallet risk score + decision
-- `/features` – Raw wallet features & flags
-- `/compare` – Compare two wallets side-by-side
+## Key Features
+- Wallet validation
+- ERC20 + normal + internal tx analysis (Etherscan V2)
+- Risk flags (new wallet, bursty activity, low diversity, etc.)
+- Hard DENY gate for insufficient history
+- Explainability breakdown (feature-level points)
+- In-memory caching
+- REST API (FastAPI)
 
-## Profiles
-Supports protocol-specific risk profiles:
-- `aave`
-- `morpho`
-- `conservative` (default)
+## Example Endpoints
+- `/score?wallet=0x...&profile=aave`
+- `/features?wallet=0x...&profile=aave`
+- `/compare?walletA=0x...&walletB=0x...`
 
 ## Demo
 Run a local demo:
