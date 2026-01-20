@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Env / secrets
+.env
+.env.*
+*.key
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data (optional: keep repo light)
+data/
+
+
