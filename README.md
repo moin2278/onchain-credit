@@ -26,3 +26,36 @@ Run a local demo:
 ```bash
 uvicorn api.main:app --reload
 ./demo.sh
+ ## Run Locally
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+
+## Set your Etherscan API key:
+
+export ETHERSCAN_API_KEY=YOUR_KEY
+
+##Start the API:
+
+uvicorn api.main:app --reload
+
+##The API will be available at:
+http://127.0.0.1:8000/docs
+
+
+This is **documentation**, not a command you’re executing now.
+
+---
+
+### 3️⃣ Save the file
+- In nano: `CTRL + O` → Enter → `CTRL + X`
+- In VS Code: `Cmd + S`
+
+---
+
+### 4️⃣ Commit and push (THIS PART YOU DO RUN)
+```bash
+git add README.md
+git commit -m "Add run instructions and project description"
+git push
