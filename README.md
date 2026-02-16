@@ -1,3 +1,11 @@
+## Latest Updates (v1.0 Production)
+
+• Rate-limit safe Etherscan ingestion  
+• Temporal trajectory endpoint  
+• Stable and explainable risk scoring  
+• Production-ready FastAPI backend  
+• Live endpoints: /features, /score, /trajectory  
+
 # On-Chain Credit Risk Scoring API
 
 A production-style FastAPI service that evaluates Ethereum wallet credit risk using on-chain behavior.
