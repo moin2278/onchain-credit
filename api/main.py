@@ -1,855 +1,459 @@
-import re
-from typing import Dict, Any, Tuple
-from time import time as now
-from fastapi import FastAPI, HTTPException
-from datetime import datetime
+from fastapi import FastAPI, Query
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import time
+import math
 import requests
-import pandas as pd
+from datetime import datetime, timezone
 
-app = FastAPI(title="On-Chain Credit Scoring API")
+app = FastAPI()
 
-# -------------------------
-# Wallet Validation
-# -------------------------
-WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+# =========================
+# Config
+# =========================
+ETHERSCAN_V2_BASE = "https://api.etherscan.io/v2/api"
+CHAIN_ID_ETH = 1
 
-def validate_wallet(wallet: str) -> str:
-    wallet = wallet.strip()
-    if not WALLET_RE.match(wallet):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid wallet address format"
-        )
-    return wallet
+DEFAULT_TIMEOUT = 20
 
-# -------------------------
-# In-Memory Cache
-# -------------------------
-CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-CACHE_TTL_SECONDS = 5  # TEMP: 5 seconds for testing
+# Etherscan constraint: page * offset <= 10000
+PAGE_SIZE = 1000
+MAX_PAGES = 10  # 10 * 1000 = 10,000 max rows
 
-def cache_get(key: str):
-    item = CACHE.get(key)
-    if not item:
-        return None
-    ts, value = item
-    if now() - ts > CACHE_TTL_SECONDS:
-        CACHE.pop(key, None)
-        return None
-    return value
+# Free-tier safe throttling (tune if you have higher plan)
+# If you hit "3/sec", use >= 0.40 sec.
+MIN_SECONDS_BETWEEN_CALLS = 0.40
 
-def cache_set(key: str, value: Dict[str, Any]):
-    CACHE[key] = (now(), value)
+# Retry/backoff
+MAX_RETRIES = 6
+BACKOFF_BASE_SECONDS = 0.8
 
-
-
-ETHERSCAN_API_KEY = "HBVI4CYSPKQWC8ZUTTFKTBNPDST6N3IZTW"
-
-# -------------------------
-# Token Classification
-# -------------------------
-STABLECOINS = {
-    "USDC", "USDT", "DAI", "FRAX", "TUSD", "USDP",
-    "GUSD", "LUSD", "USDD", "USDE", "FDUSD", "PYUSD"
+# Stablecoin symbols (best-effort)
+STABLE_SYMBOLS = {
+    "USDC", "USDT", "DAI", "TUSD", "USDP", "FDUSD", "FRAX", "LUSD", "GUSD"
 }
 
+# Simple in-memory cache (optional)
+_CACHE: Dict[str, Dict[str, Any]] = {}
 
-# -------------------------
-# Data Fetching (Etherscan V2)
-# -------------------------
-def fetch_erc20_transfers(wallet):
-    url = "https://api.etherscan.io/v2/api"
-    params = {
-        "chainid": 1,
-        "module": "account",
-        "action": "tokentx",
-        "address": wallet,
-        "startblock": 0,
-        "endblock": 99999999,
-        "sort": "asc",
-        "apikey": ETHERSCAN_API_KEY
-    }
+def cache_get(key: str) -> Optional[Dict[str, Any]]:
+    hit = _CACHE.get(key)
+    if not hit:
+        return None
+    if time.time() > hit["expires_at"]:
+        _CACHE.pop(key, None)
+        return None
+    return hit["value"]
 
-    # small retry loop (2 tries)
-    for attempt in range(2):
+def cache_set(key: str, value: Dict[str, Any], ttl_sec: int = 300) -> None:
+    _CACHE[key] = {"value": value, "expires_at": time.time() + ttl_sec}
+
+
+# =========================
+# Throttle helper (global)
+# =========================
+_LAST_CALL_AT = 0.0
+
+def _throttle_wait() -> None:
+    global _LAST_CALL_AT
+    now = time.time()
+    elapsed = now - _LAST_CALL_AT
+    if elapsed < MIN_SECONDS_BETWEEN_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_CALLS - elapsed)
+    _LAST_CALL_AT = time.time()
+
+
+# =========================
+# Etherscan helpers
+# =========================
+def etherscan_v2_call(params: Dict[str, Any], timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    """
+    One Etherscan V2 call with:
+      - global throttling
+      - retry with exponential backoff when rate-limited / NOTOK
+    """
+    last_err = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        _throttle_wait()
+
         try:
-            r = requests.get(url, params=params, timeout=15)
-            data = r.json()
-            return data.get("result", [])
-        except Exception:
-            if attempt == 1:
-                return []
+            r = requests.get(ETHERSCAN_V2_BASE, params=params, timeout=timeout)
+            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        except Exception as e:
+            last_err = f"request_exception: {e}"
+            data = None
 
-def fetch_normal_txs(wallet):
-    url = "https://api.etherscan.io/v2/api"
+        # If we couldn't parse JSON, retry
+        if not isinstance(data, dict):
+            sleep_s = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            time.sleep(sleep_s)
+            continue
+
+        status = str(data.get("status", ""))
+        message = str(data.get("message", ""))
+        result = data.get("result")
+
+        # Success
+        if status == "1" and message.upper() == "OK":
+            return data
+
+        # Rate limit / NOTOK cases
+        result_str = str(result) if result is not None else ""
+        combined = f"{message} {result_str}".lower()
+
+        is_rate_limit = ("rate limit" in combined) or ("max calls per sec" in combined)
+        if is_rate_limit:
+            sleep_s = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            time.sleep(sleep_s)
+            last_err = f"rate_limited: {message} / {result_str}"
+            continue
+
+        # Other NOTOK (invalid key, etc.) -> return immediately (no point retrying forever)
+        return data
+
+    # If all retries failed, return a NOTOK-like object
+    return {"status": "0", "message": "NOTOK", "result": f"Retries exhausted. Last error: {last_err}"}
+
+
+def _filter_by_ts(rows: List[Dict[str, Any]], start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
+    """
+    Keep items with timeStamp between [start_ts, end_ts].
+    Etherscan returns timeStamp as string.
+    """
+    out = []
+    for x in rows:
+        ts = x.get("timeStamp")
+        if ts is None:
+            continue
+        try:
+            ts_i = int(ts)
+        except Exception:
+            continue
+        if start_ts <= ts_i <= end_ts:
+            out.append(x)
+    return out
+
+
+def fetch_action_desc(
+    apikey: str,
+    wallet: str,
+    action: str,
+    start_ts: int,
+    end_ts: int,
+    sort: str = "desc",
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """
+    Fetch txs for a given action using paging within Etherscan constraints.
+    Returns: (items_in_window, error_message, truncated)
+
+    NOTE:
+      - We page and filter by timestamp locally.
+      - Early stop: if sort=desc and we already see rows older than start_ts, we can stop paging.
+    """
+    if not apikey:
+        return [], "Missing Etherscan API key (export ETHERSCAN_API_KEY=...)", False
+
+    all_rows: List[Dict[str, Any]] = []
+    truncated = False
+
+    for page in range(1, MAX_PAGES + 1):
+        params = {
+            "chainid": CHAIN_ID_ETH,
+            "module": "account",
+            "action": action,
+            "address": wallet,
+            "page": page,
+            "offset": PAGE_SIZE,
+            "sort": sort,
+            "apikey": apikey,
+        }
+
+        data = etherscan_v2_call(params)
+
+        if str(data.get("status")) != "1":
+            # NOTOK: return error
+            msg = f"Etherscan error: status={data.get('status')}, message={data.get('message')}, result={data.get('result')}"
+            return [], msg, False
+
+        rows = data.get("result", [])
+        if not isinstance(rows, list):
+            return [], f"Unexpected result type for {action}: {type(rows)}", False
+
+        if not rows:
+            break
+
+        # Filter to window
+        win_rows = _filter_by_ts(rows, start_ts, end_ts)
+        all_rows.extend(win_rows)
+
+        # Early stop when descending and we saw anything older than start_ts
+        if sort == "desc":
+            # Find minimum ts in this page
+            try:
+                min_ts = min(int(x.get("timeStamp", "0")) for x in rows)
+            except Exception:
+                min_ts = None
+            if min_ts is not None and min_ts < start_ts:
+                break
+
+        # If we keep getting full pages, there may be more
+        if len(rows) < PAGE_SIZE:
+            break
+
+        if page == MAX_PAGES:
+            truncated = True
+
+    return all_rows, None, truncated
+
+
+def get_wallet_first_seen_ts(apikey: str, wallet: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Gets earliest-ever normal tx timestamp using txlist sort=asc, offset=1.
+    This avoids wallet_age_days becoming 0 for empty 30d windows.
+    """
+    if not apikey:
+        return None, "Missing Etherscan API key"
+
     params = {
-        "chainid": 1,
+        "chainid": CHAIN_ID_ETH,
         "module": "account",
         "action": "txlist",
         "address": wallet,
-        "startblock": 0,
-        "endblock": 99999999,
+        "page": 1,
+        "offset": 1,
         "sort": "asc",
-        "apikey": ETHERSCAN_API_KEY
+        "apikey": apikey,
     }
+    data = etherscan_v2_call(params)
+    if str(data.get("status")) != "1":
+        return None, f"Etherscan error: {data.get('message')} / {data.get('result')}"
 
-    for attempt in range(2):
+    rows = data.get("result", [])
+    if not isinstance(rows, list) or not rows:
+        return None, None
+
+    try:
+        return int(rows[0]["timeStamp"]), None
+    except Exception:
+        return None, None
+
+
+# =========================
+# Feature computation
+# =========================
+def compute_features(wallet: str, window_days: int, offset_days: int, apikey: str) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    end_ts = now_ts - (offset_days * 86400)
+    start_ts = end_ts - (window_days * 86400)
+
+    errors: Dict[str, str] = {}
+    risk_flags: List[Dict[str, Any]] = []
+    truncated_any = False
+
+    # Fetch 3 buckets (in-window)
+    normal, err, trunc = fetch_action_desc(apikey, wallet, "txlist", start_ts, end_ts)
+    if err:
+        errors["normal"] = err
+    truncated_any = truncated_any or trunc
+
+    internal, err, trunc = fetch_action_desc(apikey, wallet, "txlistinternal", start_ts, end_ts)
+    if err:
+        errors["internal"] = err
+    truncated_any = truncated_any or trunc
+
+    erc20, err, trunc = fetch_action_desc(apikey, wallet, "tokentx", start_ts, end_ts)
+    if err:
+        errors["erc20"] = err
+    truncated_any = truncated_any or trunc
+
+    data_ok = (len(errors) == 0)
+
+    normal_count = len(normal) if "normal" not in errors else 0
+    internal_count = len(internal) if "internal" not in errors else 0
+    erc20_count = len(erc20) if "erc20" not in errors else 0
+
+    # wallet_age_days from FIRST EVER tx (not just window)
+    wallet_age_days = 0
+    first_seen_ts, age_err = get_wallet_first_seen_ts(apikey, wallet)
+    if age_err:
+        # not fatal, but record it
+        errors["age"] = age_err
+        data_ok = False
+    if first_seen_ts:
+        wallet_age_days = max(0, (now_ts - first_seen_ts) // 86400)
+
+    # Consistency: unique active days / window_days (based on any tx type within window)
+    active_days = set()
+    for x in (normal + internal + erc20):
         try:
-            r = requests.get(url, params=params, timeout=15)
-            data = r.json()
-            return data.get("result", [])
+            ts = int(x.get("timeStamp", "0"))
         except Exception:
-            if attempt == 1:
-                return []
-
-def fetch_internal_txs(wallet):
-    url = "https://api.etherscan.io/v2/api"
-    params = {
-        "chainid": 1,
-        "module": "account",
-        "action": "txlistinternal",
-        "address": wallet,
-        "startblock": 0,
-        "endblock": 99999999,
-        "sort": "asc",
-        "apikey": ETHERSCAN_API_KEY
-    }
-
-    for attempt in range(2):
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            data = r.json()
-            return data.get("result", [])
-        except Exception:
-            if attempt == 1:
-                return []
-
-
-
-# -------------------------
-# Feature Engineering
-# -------------------------
-def wallet_age_days_from_erc20(transfers):
-    if not transfers:
-        return 0
-    first_ts = int(transfers[0]["timeStamp"])
-    return (datetime.utcnow() - datetime.utcfromtimestamp(first_ts)).days
-
-def activity_consistency(transfers):
-    if not transfers:
-        return 0
-    df = pd.DataFrame(transfers)
-    df["timeStamp"] = pd.to_datetime(df["timeStamp"].astype(int), unit="s")
-    weekly = df.set_index("timeStamp").resample("W").size()
-    return weekly.std() / weekly.mean() if weekly.mean() > 0 else 0
-
-def token_diversity(transfers):
-    return len({tx["tokenSymbol"] for tx in transfers if tx.get("tokenSymbol")})
-
-def unique_counterparties(transfers, wallet):
-    wallet = wallet.lower()
-    counterparties = set()
-
-    for tx in transfers:
-        frm = (tx.get("from") or "").lower()
-        to = (tx.get("to") or "").lower()
-
-        if frm and frm != wallet:
-            counterparties.add(frm)
-        if to and to != wallet:
-            counterparties.add(to)
-
-    return len(counterparties)
-
-
-def stablecoin_ratio(transfers):
-    if not transfers:
-        return 0.0
-
-    stable = 0
-    total = 0
-
-    for tx in transfers:
-        sym = (tx.get("tokenSymbol") or "").upper()
-        if not sym:
             continue
-        total += 1
-        if sym in STABLECOINS:
-            stable += 1
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        active_days.add(day)
 
-    return stable / total if total > 0 else 0.0
+    consistency_score = round(len(active_days) / max(1, window_days), 4)
 
+    # Unique tokens + counterparties from ERC20
+    unique_tokens = set()
+    counterparties = set()
+    stable_count = 0
 
-# -------------------------
-# Credit Logic (FINAL)
-# -------------------------
-def risk_score(wallet_age_days, consistency, token_count, counterparty_count, stable_ratio, normal_tx_count, internal_tx_count):
-    
-    if wallet_age_days < 30 or token_count == 0:
-        return 20
+    w = wallet.lower()
+    for t in erc20:
+        sym = str(t.get("tokenSymbol", "")).upper().strip()
+        contract = str(t.get("contractAddress", "")).lower().strip()
+        frm = str(t.get("from", "")).lower().strip()
+        to = str(t.get("to", "")).lower().strip()
 
-    score = 0
+        if contract:
+            unique_tokens.add(contract)
 
-    # Wallet age
-    if wallet_age_days > 365:
-        score += 40
-    elif wallet_age_days > 90:
-        score += 25
+        # counterparties = other side of transfer relative to wallet
+        if frm == w and to:
+            counterparties.add(to)
+        elif to == w and frm:
+            counterparties.add(frm)
+
+        if sym in STABLE_SYMBOLS:
+            stable_count += 1
+
+    unique_tokens_n = len(unique_tokens)
+    unique_counterparties_n = len(counterparties)
+    stablecoin_ratio = round(stable_count / max(1, erc20_count), 4) if erc20_count else 0.0
+
+    # Risk flags based on window activity
+    if (normal_count + internal_count) == 0:
+        risk_flags.append({
+            "flag": "no_eth_activity_in_window",
+            "severity": "medium",
+            "note": f"No normal/internal tx activity in last {window_days} days"
+        })
+
+    if erc20_count == 0:
+        risk_flags.append({
+            "flag": "no_erc20_activity_in_window",
+            "severity": "high",
+            "note": f"No ERC-20 activity in last {window_days} days"
+        })
+
+    if truncated_any:
+        risk_flags.append({
+            "flag": "history_truncated",
+            "severity": "medium",
+            "note": "Wallet has more activity than fetched (hit paging limits). Features may be partial."
+        })
+
+    # Simple score (adjust as you like)
+    score = 10
+    score += min(10, len(active_days))  # up to +10
+    score += min(6, unique_tokens_n // 10)  # small bump for diversity
+
+    if erc20_count == 0:
+        score -= 12
+    if (normal_count + internal_count) == 0:
+        score -= 6
+    if truncated_any:
+        score -= 2
+
+    # Risk tier mapping (THIS is what makes inactive wallets "HIGH")
+    if not data_ok:
+        risk_tier = "UNKNOWN"
     else:
-        score += 10
-
-    # Consistency (only meaningful if active)
-    if token_count > 5:
-        if consistency < 1:
-            score += 30
-        elif consistency < 2:
-            score += 15
+        if score <= 0:
+            risk_tier = "HIGH"
+        elif score <= 6:
+            risk_tier = "MEDIUM"
         else:
-            score += 5
-    else:
-        score += 0
-
-    # Token diversity
-    if token_count > 10:
-        score += 30
-    elif token_count > 3:
-        score += 15
-    else:
-        score += 5
-
-    # Unique counterparties (real usage signal)
-    if counterparty_count > 200:
-        score += 10
-    elif counterparty_count > 50:
-        score += 7
-    elif counterparty_count > 10:
-        score += 3
-
-    # Stablecoin ratio (finance-like behavior signal)
-    if stable_ratio > 0.60:
-        score += 10
-    elif stable_ratio > 0.30:
-        score += 5
-
-        # Transaction activity (coverage signal)
-    # Normal txs show general usage; internal txs show contract interactions
-    if normal_tx_count > 200:
-        score += 6
-    elif normal_tx_count > 50:
-        score += 3
-
-    if internal_tx_count > 50:
-        score += 6
-    elif internal_tx_count > 10:
-        score += 3
-
-    return min(score, 100)
-
-def credit_decision(wallet_age_days, token_count, score, risk_tier):
-    # hard cold-start requirements
-    MIN_AGE_DAYS = 30
-    MIN_TOKEN_ACTIVITY = 1
-
-    if wallet_age_days < MIN_AGE_DAYS or token_count < MIN_TOKEN_ACTIVITY:
-        return {
-            "status": "DENY",
-            "reason": "insufficient_history",
-            "min_required_age_days": MIN_AGE_DAYS,
-            "min_required_token_activity": MIN_TOKEN_ACTIVITY
-        }
-
-    # policy by tier
-    if risk_tier == "HIGH":
-        return {"status": "DENY", "reason": "high_risk"}
-    if risk_tier == "MEDIUM":
-        return {"status": "LIMIT", "reason": "medium_risk"}
-    return {"status": "ALLOW", "reason": "ok"}
-
-
-
-def risk_tier(score):
-    if score >= 75:
-        return "LOW"
-    elif score >= 45:
-        return "MEDIUM"
-    else:
-        return "HIGH"
-
-PROFILES = {
-    "conservative": {
-        "low":    {"max_ltv": 0.60, "apr": 0.09, "collateral_factor": 1.4},
-        "medium": {"max_ltv": 0.45, "apr": 0.13, "collateral_factor": 1.7},
-        "high":   {"max_ltv": 0.25, "apr": 0.20, "collateral_factor": 2.2},
-    },
-    "aave": {
-        "low":    {"max_ltv": 0.65, "apr": 0.08, "collateral_factor": 1.3},
-        "medium": {"max_ltv": 0.50, "apr": 0.12, "collateral_factor": 1.6},
-        "high":   {"max_ltv": 0.25, "apr": 0.20, "collateral_factor": 2.2},
-    },
-    "morpho": {
-        "low":    {"max_ltv": 0.70, "apr": 0.075, "collateral_factor": 1.25},
-        "medium": {"max_ltv": 0.55, "apr": 0.11, "collateral_factor": 1.55},
-        "high":   {"max_ltv": 0.30, "apr": 0.18, "collateral_factor": 2.0},
-    }
-}
-
-
-def collateral_recommendation(
-    score,
-    risk_tier,
-    consistency,
-    stable_ratio,
-    normal_tx_count,
-    internal_tx_count,
-    profile: str = "conservative"
-):
-    profile = (profile or "conservative").lower()
-    if profile not in PROFILES:
-        profile = "conservative"
-
-    tier_key = "low" if risk_tier == "LOW" else "medium" if risk_tier == "MEDIUM" else "high"
-    base = PROFILES[profile][tier_key]
-
-    recommendation = {
-        "profile": profile,
-        "max_ltv": base["max_ltv"],
-        "collateral_factor": base["collateral_factor"],
-        "suggested_interest_rate_apr": base["apr"],
-        "policy": tier_key,
-        "rationale": [f"Base policy from '{profile}' profile ({risk_tier})"]
-    }
-
-    # Behavioral adjustments (small, explainable)
-    if stable_ratio > 0.5:
-        recommendation["max_ltv"] += 0.05
-        recommendation["rationale"].append("High stablecoin usage (+LTV)")
-
-    if consistency > 2:
-        recommendation["max_ltv"] -= 0.05
-        recommendation["rationale"].append("Highly irregular activity (-LTV)")
-
-    if internal_tx_count > normal_tx_count:
-        recommendation["max_ltv"] -= 0.05
-        recommendation["rationale"].append("High contract interaction risk (-LTV)")
-
-    recommendation["max_ltv"] = max(0.15, min(recommendation["max_ltv"], 0.75))
-    return recommendation
-
-
-    # --------------------
-    # Risk tier driven policy
-    # --------------------
-    if risk_tier == "LOW":
-        recommendation["max_ltv"] = 0.65
-        recommendation["collateral_factor"] = 1.3
-        recommendation["suggested_interest_rate_apr"] = 0.08
-        recommendation["policy"] = "aggressive"
-        recommendation["rationale"].append("Low risk tier")
-
-    elif risk_tier == "MEDIUM":
-        recommendation["max_ltv"] = 0.50
-        recommendation["collateral_factor"] = 1.6
-        recommendation["suggested_interest_rate_apr"] = 0.12
-        recommendation["policy"] = "conservative"
-        recommendation["rationale"].append("Medium risk tier")
-
-    else:  # HIGH
-        recommendation["max_ltv"] = 0.25
-        recommendation["collateral_factor"] = 2.2
-        recommendation["suggested_interest_rate_apr"] = 0.20
-        recommendation["policy"] = "restrictive"
-        recommendation["rationale"].append("High risk tier")
-
-    # --------------------
-    # Behavioral adjustments
-    # --------------------
-
-    # Stablecoin behavior = lower volatility
-    if stable_ratio > 0.5:
-        recommendation["max_ltv"] += 0.05
-        recommendation["rationale"].append("High stablecoin usage")
-
-    # Consistency penalty
-    if consistency > 2:
-        recommendation["max_ltv"] -= 0.05
-        recommendation["rationale"].append("Highly irregular activity")
-
-    # Heavy contract interaction = smart contract risk
-    if internal_tx_count > normal_tx_count:
-        recommendation["max_ltv"] -= 0.05
-        recommendation["rationale"].append("High contract interaction risk")
-
-    # Clamp LTV safely
-    recommendation["max_ltv"] = max(0.15, min(recommendation["max_ltv"], 0.75))
-
-    return recommendation
-
-
-def explain_score(wallet_age_days, consistency, token_count):
-    reasons = []
-
-    # Wallet age
-    if wallet_age_days > 365:
-        reasons.append("Wallet age > 1 year")
-    elif wallet_age_days > 90:
-        reasons.append("Wallet age > 3 months")
-    else:
-        reasons.append("Very new wallet")
-
-    # Consistency
-    if token_count > 5:
-        if consistency < 1:
-            reasons.append("Consistent weekly activity")
-        elif consistency < 2:
-            reasons.append("Moderately consistent activity")
-        else:
-            reasons.append("Highly irregular activity")
-    else:
-        reasons.append("Limited activity history")
-
-    # Token diversity
-    if token_count > 10:
-        reasons.append("High token diversity")
-    elif token_count > 3:
-        reasons.append("Moderate token diversity")
-    else:
-        reasons.append("Low token diversity")
-
-    return reasons
-
-def score_wallet_internal(wallet: str):
-    transfers = fetch_erc20_transfers(wallet)
-
-    age = wallet_age_days_from_erc20(transfers)
-    consistency = activity_consistency(transfers)
-    tokens = token_diversity(transfers)
-
-    score = risk_score(age, consistency, tokens)
-    tier = risk_tier(score)
-    reasons = explain_score(age, consistency, tokens)
+            risk_tier = "LOW"
 
     return {
         "wallet": wallet,
-        "wallet_age_days": age,
-        "consistency_score": round(consistency, 3),
-        "unique_tokens": tokens,
-        "score": score,
-        "risk_tier": tier,
-        "reasons": reasons
+        "window_days": window_days,
+        "offset_days": offset_days,
+        "data_ok": data_ok,
+        "errors": errors,
+        "wallet_age_days": int(wallet_age_days),
+        "consistency_score": float(consistency_score),
+        "unique_tokens": int(unique_tokens_n),
+        "unique_counterparties": int(unique_counterparties_n),
+        "stablecoin_ratio": float(stablecoin_ratio),
+        "normal_tx_count": int(normal_count),
+        "internal_tx_count": int(internal_count),
+        "erc20_tx_count": int(erc20_count),
+        "score": int(score),
+        "risk_tier": risk_tier,
+        "risk_flags": risk_flags,
     }
 
-def score_breakdown(
-    wallet_age_days,
-    consistency,
-    token_count,
-    counterparty_count,
-    stable_ratio,
-    normal_tx_count,
-    internal_tx_count
-):
-    breakdown = {
-        "gate_triggered": False,
-        "components": {
-            "wallet_age": {"points": 0, "note": ""},
-            "consistency": {"points": 0, "note": ""},
-            "token_diversity": {"points": 0, "note": ""},
-            "counterparties": {"points": 0, "note": ""},
-            "stablecoin_behavior": {"points": 0, "note": ""},
-            "normal_activity": {"points": 0, "note": ""},
-            "contract_activity": {"points": 0, "note": ""},
-        },
-        "reasons": [],
-        "warnings": []
-    }
 
-    # --------------------
-    # Hard gate
-    # --------------------
-    if wallet_age_days < 30 or token_count == 0:
-        breakdown["gate_triggered"] = True
-        breakdown["warnings"].append(
-            "Insufficient on-chain history (new wallet or no token activity)."
-        )
-        return breakdown
+def compute_trajectory(curr: Dict[str, Any], prev: Dict[str, Any]) -> Dict[str, Any]:
+    keys = [
+        "consistency_score",
+        "unique_tokens",
+        "unique_counterparties",
+        "stablecoin_ratio",
+        "normal_tx_count",
+        "internal_tx_count",
+        "erc20_tx_count",
+        "score",
+    ]
+    deltas = {k: float(curr.get(k, 0)) - float(prev.get(k, 0)) for k in keys}
 
-    # --------------------
-    # Wallet age
-    # --------------------
-    if wallet_age_days > 365:
-        breakdown["components"]["wallet_age"]["points"] = 40
-        breakdown["components"]["wallet_age"]["note"] = "Wallet older than 1 year."
-        breakdown["reasons"].append("Long wallet history.")
-    elif wallet_age_days > 90:
-        breakdown["components"]["wallet_age"]["points"] = 25
-        breakdown["components"]["wallet_age"]["note"] = "Wallet older than 90 days."
-        breakdown["reasons"].append("Moderate wallet history.")
-    else:
-        breakdown["components"]["wallet_age"]["points"] = 10
-        breakdown["components"]["wallet_age"]["note"] = "Wallet younger than 90 days."
+    # Direction heuristic
+    risk_dir = "flat"
+    if deltas["score"] > 0:
+        risk_dir = "improving"
+    elif deltas["score"] < 0:
+        risk_dir = "worsening"
 
-    # --------------------
-    # Consistency
-    # --------------------
-    if token_count > 5:
-        if consistency < 1:
-            breakdown["components"]["consistency"]["points"] = 30
-            breakdown["components"]["consistency"]["note"] = "Stable weekly activity."
-            breakdown["reasons"].append("Consistent activity over time.")
-        elif consistency < 2:
-            breakdown["components"]["consistency"]["points"] = 15
-            breakdown["components"]["consistency"]["note"] = "Some activity variability."
-            breakdown["reasons"].append("Moderately consistent activity.")
-        else:
-            breakdown["components"]["consistency"]["points"] = 5
-            breakdown["components"]["consistency"]["note"] = "Highly bursty / irregular activity."
-            breakdown["reasons"].append("Irregular activity patterns (higher risk).")
-    else:
-        breakdown["warnings"].append(
-            "Consistency not evaluated due to low activity breadth."
-        )
-
-    # --------------------
-    # Token diversity
-    # --------------------
-    if token_count > 10:
-        breakdown["components"]["token_diversity"]["points"] = 30
-        breakdown["components"]["token_diversity"]["note"] = "Interacted with many distinct tokens."
-        breakdown["reasons"].append("High token diversity.")
-    elif token_count > 3:
-        breakdown["components"]["token_diversity"]["points"] = 15
-        breakdown["components"]["token_diversity"]["note"] = "Interacted with a few distinct tokens."
-        breakdown["reasons"].append("Moderate token diversity.")
-    else:
-        breakdown["components"]["token_diversity"]["points"] = 5
-        breakdown["components"]["token_diversity"]["note"] = "Very low token diversity."
-
-    # --------------------
-    # Counterparties
-    # --------------------
-    if counterparty_count > 200:
-        breakdown["components"]["counterparties"]["points"] = 10
-        breakdown["components"]["counterparties"]["note"] = "Very high number of counterparties."
-        breakdown["reasons"].append("High counterparty diversity (strong real-usage signal).")
-    elif counterparty_count > 50:
-        breakdown["components"]["counterparties"]["points"] = 7
-        breakdown["components"]["counterparties"]["note"] = "High number of counterparties."
-        breakdown["reasons"].append("Good counterparty diversity.")
-    elif counterparty_count > 10:
-        breakdown["components"]["counterparties"]["points"] = 3
-        breakdown["components"]["counterparties"]["note"] = "Some counterparty diversity."
-    else:
-        breakdown["components"]["counterparties"]["note"] = "Low counterparty diversity."
-        breakdown["warnings"].append(
-            "Low counterparty diversity may indicate a single-purpose wallet."
-        )
-
-    # --------------------
-    # Stablecoin behavior
-    # --------------------
-    if stable_ratio > 0.60:
-        breakdown["components"]["stablecoin_behavior"]["points"] = 10
-        breakdown["components"]["stablecoin_behavior"]["note"] = (
-            f"High stablecoin usage ({stable_ratio:.2f})."
-        )
-        breakdown["reasons"].append("High stablecoin usage (lower volatility behavior).")
-    elif stable_ratio > 0.30:
-        breakdown["components"]["stablecoin_behavior"]["points"] = 5
-        breakdown["components"]["stablecoin_behavior"]["note"] = (
-            f"Moderate stablecoin usage ({stable_ratio:.2f})."
-        )
-        breakdown["reasons"].append("Moderate stablecoin usage.")
-    else:
-        breakdown["components"]["stablecoin_behavior"]["note"] = (
-            f"Low stablecoin usage ({stable_ratio:.2f})."
-        )
-
-    # --------------------
-    # Normal tx activity
-    # --------------------
-    if normal_tx_count > 200:
-        breakdown["components"]["normal_activity"]["points"] = 6
-        breakdown["components"]["normal_activity"]["note"] = (
-            f"High normal tx activity ({normal_tx_count})."
-        )
-        breakdown["reasons"].append("High normal transaction activity.")
-    elif normal_tx_count > 50:
-        breakdown["components"]["normal_activity"]["points"] = 3
-        breakdown["components"]["normal_activity"]["note"] = (
-            f"Moderate normal tx activity ({normal_tx_count})."
-        )
-        breakdown["reasons"].append("Moderate normal transaction activity.")
-    else:
-        breakdown["components"]["normal_activity"]["note"] = (
-            f"Low normal tx activity ({normal_tx_count})."
-        )
-
-    # --------------------
-    # Internal tx activity
-    # --------------------
-    if internal_tx_count > 50:
-        breakdown["components"]["contract_activity"]["points"] = 6
-        breakdown["components"]["contract_activity"]["note"] = (
-            f"High internal tx activity ({internal_tx_count})."
-        )
-        breakdown["reasons"].append("High contract interaction activity.")
-    elif internal_tx_count > 10:
-        breakdown["components"]["contract_activity"]["points"] = 3
-        breakdown["components"]["contract_activity"]["note"] = (
-            f"Moderate internal tx activity ({internal_tx_count})."
-        )
-        breakdown["reasons"].append("Moderate contract interaction activity.")
-    else:
-        breakdown["components"]["contract_activity"]["note"] = (
-            f"Low internal tx activity ({internal_tx_count})."
-        )
-
-    return breakdown
-
-def risk_flags(
-    wallet_age_days,
-    consistency,
-    token_count,
-    counterparty_count,
-    stable_ratio,
-    normal_tx_count,
-    internal_tx_count
-):
-    flags = []
-
-    # Cold start / thin history
-    if wallet_age_days < 30 or token_count == 0:
-        flags.append({"flag": "low_history", "severity": "high", "note": "New wallet or no token activity."})
-
-    # Behavior irregularity
-    if consistency > 2:
-        flags.append({"flag": "bursty_activity", "severity": "medium", "note": "Highly irregular activity over time."})
-
-    # Very low breadth
-    if token_count <= 3:
-        flags.append({"flag": "low_token_diversity", "severity": "medium", "note": "Few distinct tokens interacted with."})
-
-    if counterparty_count <= 10:
-        flags.append({"flag": "low_counterparty_diversity", "severity": "medium", "note": "Few distinct counterparties."})
-
-    # Contract-heavy behavior (can be riskier depending on context)
-    if internal_tx_count > normal_tx_count and internal_tx_count > 10:
-        flags.append({"flag": "contract_heavy_activity", "severity": "medium", "note": "Internal txs exceed normal txs."})
-
-    # Low stablecoin usage (more volatility exposure)
-    if stable_ratio < 0.10 and token_count > 3:
-        flags.append({"flag": "low_stablecoin_usage", "severity": "low", "note": "Limited stablecoin usage observed."})
-
-    return flags
+    return {"deltas": deltas, "direction": {"risk": risk_dir}}
 
 
-def compute_wallet_result(wallet: str, profile: str = "conservative"):
-    wallet = validate_wallet(wallet)
-
-    cached = cache_get(f"{wallet}:{profile}")
-    if cached:
-        return {**cached, "cached": True}
-
-    transfers = fetch_erc20_transfers(wallet)
-    normal_txs = fetch_normal_txs(wallet)
-    internal_txs = fetch_internal_txs(wallet)
-
-    # ✅ counts (fix)
-    normal_tx_count = len(normal_txs)
-    internal_tx_count = len(internal_txs)
-
-    age = wallet_age_days_from_erc20(transfers)
-    consistency = activity_consistency(transfers)
-    tokens = token_diversity(transfers)
-    counterparties = unique_counterparties(transfers, wallet)
-    stable_ratio = stablecoin_ratio(transfers)
-
-    score = risk_score(age, consistency, tokens, counterparties, stable_ratio, normal_tx_count, internal_tx_count)
-    tier = risk_tier(score)
-
-    decision = credit_decision(age, tokens, score, tier)
-
-    breakdown = score_breakdown(
-        age, consistency, tokens, counterparties,
-        stable_ratio, normal_tx_count, internal_tx_count
-    )
-
-    recommendation = collateral_recommendation(
-        score=score,
-        risk_tier=tier,
-        consistency=consistency,
-        stable_ratio=stable_ratio,
-        normal_tx_count=normal_tx_count,
-        internal_tx_count=internal_tx_count,
-        profile=profile
-    )
-
-    # 🔒 HARD GATE — override recommendation if DENY
-    if decision["status"] == "DENY":
-        recommendation = {
-            "profile": profile,
-            "max_ltv": 0.0,
-            "collateral_factor": None,
-            "suggested_interest_rate_apr": None,
-            "policy": "deny",
-            "rationale": ["Denied due to insufficient history or elevated risk."]
-        }
-
-    test_summary = {
-        "score": score,
-        "risk_tier": tier,
-        "normal_tx_count": normal_tx_count,
-        "internal_tx_count": internal_tx_count,
-    }
-
-    flags = risk_flags(
-          age, consistency, tokens, counterparties,
-          stable_ratio, normal_tx_count, internal_tx_count
-    )
-  
-
-
-    result = {
-        "wallet": wallet,
-        "wallet_age_days": age,
-        "consistency_score": round(consistency, 3),
-        "unique_tokens": tokens,
-        "unique_counterparties": counterparties,
-        "stablecoin_ratio": round(stable_ratio, 3),
-        "normal_tx_count": normal_tx_count,
-        "internal_tx_count": internal_tx_count,
-        "score": score,
-        "risk_tier": tier,
-        "decision": decision,
-        "recommendation": recommendation,
-        "risk_flags": flags,
-        "explainability": breakdown,
-        "test_summary": test_summary
-    }
-
-    cache_set(f"{wallet}:{profile}", result)
-    return {**result, "cached": False}
-
-
-
-
-
-# -------------------------
-# API Endpoint
-# -------------------------
-@app.get("/score")
-def score_wallet(wallet: str, profile: str = "conservative"):
-    return compute_wallet_result(wallet, profile)
-
-    transfers = fetch_erc20_transfers(wallet)
-    normal_txs = fetch_normal_txs(wallet)
-    internal_txs = fetch_internal_txs(wallet)
-
-    normal_tx_count = len(normal_txs)
-    internal_tx_count = len(internal_txs)
-  
-
-
-    age = wallet_age_days_from_erc20(transfers)
-    consistency = activity_consistency(transfers)
-    tokens = token_diversity(transfers)
-    counterparties = unique_counterparties(transfers, wallet)
-    stable_ratio = stablecoin_ratio(transfers)
-
-
-    score = risk_score(age, consistency, tokens, counterparties, stable_ratio, normal_tx_count, internal_tx_count)
-    tier = risk_tier(score)
-    breakdown = score_breakdown(age, consistency, tokens, counterparties, stable_ratio, normal_tx_count, internal_tx_count)
-    recommendation = collateral_recommendation(
-    score=score,
-    risk_tier=tier,
-    consistency=consistency,
-    stable_ratio=stable_ratio,
-    normal_tx_count=normal_tx_count,
-    internal_tx_count=internal_tx_count,
-    profile=profile
-)
-
-@app.get("/compare")
-def compare(walletA: str, walletB: str, profile: str = "conservative"):
-    a = compute_wallet_result(walletA, profile)
-    b = compute_wallet_result(walletB, profile)
-
-    # Decide winner by score
-    if a["score"] > b["score"]:
-        winner = "walletA"
-    elif b["score"] > a["score"]:
-        winner = "walletB"
-    else:
-        winner = "tie"
-
-    summary = {
-        "profile": profile,
-        "walletA": walletA,
-        "walletB": walletB,
-        "winner": winner,
-        "walletA_score": a["score"],
-        "walletB_score": b["score"],
-        "walletA_risk_tier": a["risk_tier"],
-        "walletB_risk_tier": b["risk_tier"],
-        "reason": (
-            "Higher score indicates lower estimated risk based on current signals."
-            if winner != "tie"
-            else "Scores are equal under current signals."
-        )
-    }
-
-    return summary
-
+# =========================
+# API Endpoints
+# =========================
 @app.get("/features")
-def features(wallet: str, profile: str = "conservative"):
-    r = compute_wallet_result(wallet, profile)
+def features(
+    wallet: str = Query(...),
+    profile: str = Query("aave"),
+    window_days: int = Query(30),
+    offset_days: int = Query(0),
+):
+    # Read key from env
+    apikey = os.getenv("ETHERSCAN_API_KEY", "").strip()
 
-    # Return ONLY numeric + categorical features (ML-ready)
-    return {
-        "wallet": r["wallet"],
-        "profile": profile,
-        "features": {
-            "wallet_age_days": r["wallet_age_days"],
-            "consistency_score": r["consistency_score"],
-            "unique_tokens": r["unique_tokens"],
-            "unique_counterparties": r["unique_counterparties"],
-            "stablecoin_ratio": r["stablecoin_ratio"],
-            "normal_tx_count": r["normal_tx_count"],
-            "internal_tx_count": r["internal_tx_count"],
-            "risk_tier": r["risk_tier"],   # label-like categorical
-            "score": r["score"],           # label-like numeric
-        },
-        "risk_flags": r.get("risk_flags", [])
+    cache_key = f"features:{wallet}:{profile}:{window_days}:{offset_days}"
+    cached = cache_get(cache_key)
+    if cached:
+        cached["cached"] = True
+        cached["_cached_at"] = int(time.time())
+        return {"wallet": wallet, "profile": profile, "features": cached}
+
+    feats = compute_features(wallet, window_days, offset_days, apikey)
+    feats["cached"] = False
+    feats["_cached_at"] = int(time.time())
+
+    cache_set(cache_key, feats, ttl_sec=300)
+    return {"wallet": wallet, "profile": profile, "features": feats}
+
+
+@app.get("/trajectory")
+def trajectory(
+    wallet: str = Query(...),
+    profile: str = Query("aave"),
+    window_days: int = Query(30),
+):
+    apikey = os.getenv("ETHERSCAN_API_KEY", "").strip()
+
+    curr = compute_features(wallet, window_days, 0, apikey)
+    prev = compute_features(wallet, window_days, window_days, apikey)
+
+    traj = {
+        "wallet_age_days": curr.get("wallet_age_days", 0),
+        "current": curr,
+        "previous": prev,
+        **compute_trajectory(curr, prev),
     }
-
-
-
-
-    # -------- Test Summary (for debugging / iteration) --------
-    test_summary = {
-         "score": score,
-         "risk_tier": tier,
-         "normal_tx_count": normal_tx_count,
-         "internal_tx_count": internal_tx_count,
-    }
-
-
-
-    result = {
-        "wallet": wallet,
-        "wallet_age_days": age,
-        "consistency_score": round(consistency, 3),
-        "unique_tokens": tokens,
-        "unique_counterparties": counterparties,
-        "stablecoin_ratio": round(stable_ratio, 3),
-        "normal_tx_count": normal_tx_count,
-        "internal_tx_count": internal_tx_count,
-        "score": score,
-        "risk_tier": tier,
-        "recommendation": recommendation,
-        "explainability": breakdown,
-        "test_summary": test_summary
-    }
-
-    cache_set(wallet, result)
-    return {**result, "cached": False}
+    return {"wallet": wallet, "profile": profile, "trajectory": traj}
