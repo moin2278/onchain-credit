@@ -1,0 +1,10 @@
+# Demo wallets for testing API
+
+# Active / Low Risk
+0x742d35Cc6634C0532925a3b844Bc454e4438f44e
+
+# Medium Risk
+0xC072892b578e3a51B2D994C4f3fa9dF5B3199713
+
+# New Wallet (Expected DENY)
+0xdCe05440Cd346977875da4aCb90eDf85281fFce7

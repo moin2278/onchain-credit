@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Onchain Credit — Borrower risk, backtested</title>
+<meta name="description" content="Explainable liquidation-risk scoring for DeFi lending, validated against 18 months of Aave V3 liquidations. CV AUC 0.72 at borrow time.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F6F7F4; --panel:#FDFDFB; --ink:#161D1C; --muted:#5A6663;
+    --grid:#DCE1DB; --petrol:#1F4E5F; --petrol-soft:#E7EEF0;
+    --hi:#B3402A; --mid:#B07C1F; --lo:#2E6B4F;
+    --mono:'IBM Plex Mono',monospace; --sans:'IBM Plex Sans',sans-serif;
+    --serif:'Newsreader',serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);
+       font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:860px;margin:0 auto;padding:0 24px}
+  .rule{border-left:2px solid var(--ink);padding-left:22px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+           text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  a{color:var(--petrol)}
+  a:focus-visible,button:focus-visible,input:focus-visible{
+    outline:2px solid var(--petrol);outline-offset:2px}
+
+  header{padding:26px 0;border-bottom:1px solid var(--grid)}
+  header .wrap{display:flex;justify-content:space-between;align-items:baseline}
+  .brand{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--ink);text-decoration:none}
+  nav a{font-family:var(--mono);font-size:13px;margin-left:22px;text-decoration:none}
+  nav a:hover{text-decoration:underline}
+
+  .hero{padding:72px 0 56px}
+  h1{font-family:var(--serif);font-weight:500;font-size:clamp(30px,4.6vw,44px);
+     line-height:1.14;letter-spacing:-.01em;max-width:21ch}
+  h1 em{font-style:italic;color:var(--hi)}
+  .hero p{margin-top:20px;max-width:58ch;color:var(--muted)}
+  .hero .stats{display:flex;gap:36px;margin-top:30px;flex-wrap:wrap}
+  .stat b{font-family:var(--mono);font-size:22px;font-weight:500;display:block}
+  .stat span{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+             text-transform:uppercase;color:var(--muted)}
+
+  section{padding:52px 0;border-top:1px solid var(--grid)}
+  h2{font-family:var(--serif);font-weight:500;font-size:26px;margin-bottom:10px}
+  .lede{color:var(--muted);max-width:60ch}
+
+  /* Terminal */
+  .terminal{background:var(--panel);border:1px solid var(--grid);margin-top:26px}
+  .term-head{display:flex;justify-content:space-between;align-items:center;
+             padding:12px 18px;border-bottom:1px solid var(--grid);
+             font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .term-body{padding:22px 18px}
+  .inrow{display:flex;gap:10px;flex-wrap:wrap}
+  input[type=text]{flex:1;min-width:260px;font-family:var(--mono);font-size:14px;
+     padding:12px 14px;border:1px solid var(--grid);background:#fff;color:var(--ink)}
+  button{font-family:var(--mono);font-size:14px;padding:12px 22px;cursor:pointer;
+     background:var(--ink);color:var(--paper);border:1px solid var(--ink)}
+  button:hover{background:var(--petrol);border-color:var(--petrol)}
+  button:disabled{opacity:.5;cursor:wait}
+  .hint{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:10px}
+  .hint a{cursor:pointer;text-decoration:underline}
+
+  .result{margin-top:26px;display:none}
+  .memo-top{display:flex;justify-content:space-between;align-items:flex-start;
+            gap:16px;flex-wrap:wrap}
+  .stamp{font-family:var(--mono);font-size:13px;font-weight:500;letter-spacing:.08em;
+         padding:8px 14px;border:2px solid}
+  .stamp.HIGH{color:var(--hi);border-color:var(--hi)}
+  .stamp.MEDIUM{color:var(--mid);border-color:var(--mid)}
+  .stamp.LOW{color:var(--lo);border-color:var(--lo)}
+  .prob{font-family:var(--mono)}
+  .prob b{font-size:30px;font-weight:500}
+  .prob span{font-size:11px;text-transform:uppercase;letter-spacing:.1em;
+             color:var(--muted);display:block}
+
+  .gauge{position:relative;height:14px;background:
+     linear-gradient(90deg,var(--lo) 0 33%,var(--mid) 33% 66%,var(--hi) 66% 100%);
+     opacity:.92;margin:22px 0 6px}
+  .needle{position:absolute;top:-5px;width:2px;height:24px;background:var(--ink)}
+  .gauge-labels{display:flex;justify-content:space-between;font-family:var(--mono);
+     font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+
+  .drivers{margin-top:26px}
+  .drivers h3{font-family:var(--mono);font-size:12px;letter-spacing:.12em;
+     text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  .drv{display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;
+       font-family:var(--mono);font-size:12.5px;padding:6px 0;border-bottom:1px dashed var(--grid)}
+  .bar{height:10px;position:relative;background:var(--petrol-soft)}
+  .bar i{position:absolute;top:0;bottom:0}
+  .bar i.up{background:var(--hi)} .bar i.down{background:var(--lo)}
+  .drv .dir{text-align:right;color:var(--muted)}
+  .fineprint{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:18px;line-height:1.6}
+  .error{font-family:var(--mono);font-size:13px;color:var(--hi);margin-top:18px;display:none}
+
+  /* Findings table */
+  table{width:100%;border-collapse:collapse;margin-top:22px;font-size:14.5px}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+     color:var(--muted);text-align:left;padding:10px 12px;border-bottom:2px solid var(--ink)}
+  td{padding:11px 12px;border-bottom:1px solid var(--grid);vertical-align:top}
+  td.num{font-family:var(--mono)}
+  .fail{color:var(--hi)} .pass{color:var(--lo)}
+
+  .findings li{margin:12px 0 12px 20px;max-width:62ch}
+  .findings b{font-weight:600}
+
+  footer{padding:44px 0 60px;border-top:1px solid var(--grid);
+         font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  footer a{margin-right:22px}
+  @media (max-width:640px){.drv{grid-template-columns:130px 1fr 80px}}
+  @media (prefers-reduced-motion:no-preference){
+    .result.show{display:block;animation:rise .35s ease}
+    @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+  }
+  @media (prefers-reduced-motion:reduce){.result.show{display:block}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="/">onchain-credit</a>
+    <nav>
+      <a href="#terminal">Live scoring</a>
+      <a href="#research">Research</a>
+      <a href="/docs">API</a>
+      <a href="https://github.com/moin2278/onchain-credit">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap rule">
+    <div class="eyebrow">Borrower risk research — Aave V3, Ethereum</div>
+    <h1>Wallet reputation does not predict liquidation. <em>Borrower behavior does.</em></h1>
+    <p>We backtested wallet-level risk scoring against 18 months of real Aave V3
+       liquidations — and published the failures along with the result. Hand-tuned
+       "reputation" scores carried zero signal. A fitted model on borrowing history
+       and behavior predicts 90-day liquidation at borrow time.</p>
+    <div class="stats">
+      <div class="stat"><b>0.72</b><span>CV AUC at borrow time</span></div>
+      <div class="stat"><b>62.9% vs 33.3%</b><span>held-out liq. rate, high vs low</span></div>
+      <div class="stat"><b>600</b><span>labeled borrowers, point-in-time</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="terminal">
+  <div class="wrap">
+    <div class="eyebrow">Exhibit A — Live scoring terminal</div>
+    <h2>Score any wallet with the published model</h2>
+    <p class="lede">This runs the exact logistic model from the backtest — not a demo
+       heuristic. Enter an Ethereum address; the model fetches its recent behavior and
+       Aave borrowing history, then returns liquidation-risk probability with the
+       drivers behind it.</p>
+
+    <div class="terminal">
+      <div class="term-head">
+        <span>score_model · aave_v3 · ethereum mainnet</span>
+        <span id="modelmeta">loading model…</span>
+      </div>
+      <div class="term-body">
+        <div class="inrow">
+          <input id="wallet" type="text" spellcheck="false"
+                 placeholder="0x… wallet address" aria-label="Ethereum wallet address">
+          <button id="go">Score wallet</button>
+        </div>
+        <div class="hint">No address handy? <a id="sample">Use a sample wallet</a>
+          · 20 scores/hour per visitor · nothing is stored</div>
+
+        <div class="error" id="err"></div>
+
+        <div class="result" id="res">
+          <div class="memo-top">
+            <div>
+              <div class="eyebrow" style="margin-bottom:6px">Assessment</div>
+              <div class="prob"><b id="prob">—</b><span>P(liquidated within 90d | borrows now)</span></div>
+            </div>
+            <div class="stamp" id="stamp">—</div>
+          </div>
+          <div class="gauge"><div class="needle" id="needle" style="left:0%"></div></div>
+          <div class="gauge-labels"><span>lower risk</span><span>higher risk</span></div>
+          <div class="drivers">
+            <h3>What moved this score</h3>
+            <div id="drv"></div>
+          </div>
+          <div class="fineprint" id="fine"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="research">
+  <div class="wrap">
+    <div class="eyebrow">Exhibit B — The backtest</div>
+    <h2>Three rounds, one honest number</h2>
+    <p class="lede">Every round is reproducible from public data with the open-source
+       pipeline. Round 2 was discarded after we found a confound in our own design.</p>
+    <table>
+      <thead><tr><th>Round</th><th>Design</th><th>Outcome</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td>Hand-tuned reputation score (age, activity, diversity)</td>
+            <td class="fail">No signal — HIGH tier liquidated 48.6% vs LOW 54.4%</td></tr>
+        <tr><td class="num">2</td><td>Fitted model, liquidation-anchored</td>
+            <td class="fail">AUC 0.74 — rejected: anchor-selection confound</td></tr>
+        <tr><td class="num">3</td><td>Fitted model, borrow-anchored (production framing)</td>
+            <td class="pass">CV AUC 0.720 ± 0.057 · held-out 62.9% vs 33.3%</td></tr>
+      </tbody>
+    </table>
+
+    <ul class="findings" style="margin-top:26px">
+      <li><b>Liquidated borrowers are older and more active</b> than safe ones
+          (median wallet age 522 vs 105 days). Sophistication correlates with
+          leverage, not safety.</li>
+      <li><b>Borrower inexperience is the strongest risk marker.</b> First-time
+          borrowers are liquidated at far higher rates — novice risk shows up
+          onchain like it does in traditional credit.</li>
+      <li><b>Stablecoin-heavy flows lean risk,</b> consistent with leverage
+          looping — the opposite of the usual scoring assumption.</li>
+    </ul>
+    <p style="margin-top:22px">
+      <a href="https://github.com/moin2278/onchain-credit/blob/main/RESEARCH_NOTE.md">
+      Read the full research note, including limitations →</a></p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="eyebrow">For risk teams</div>
+    <h2>Run it on your own book</h2>
+    <p class="lede">The pipeline, the model, and the evaluation are open source.
+       If you run a lending protocol, curate vaults, or hold DeFi credit exposure,
+       the same backtest can be run against your borrower set — or we can walk
+       through the methodology together.</p>
+    <p style="margin-top:18px;font-family:var(--mono);font-size:14px">
+      <a href="https://github.com/moin2278/onchain-credit">github.com/moin2278/onchain-credit</a><br>
+      <a href="https://www.linkedin.com/in/moinhasan">Contact — Moin Hasan</a>
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <a href="https://github.com/moin2278/onchain-credit">GitHub</a>
+    <a href="/docs">API docs</a>
+    <a href="https://github.com/moin2278/onchain-credit/blob/main/RESEARCH_NOTE.md">Research note</a>
+    <p style="margin-top:16px;max-width:70ch">Research tool, not financial advice.
+       Scores are model outputs with stated limitations — read the research note
+       before relying on them. Single protocol (Aave V3), single chain (Ethereum).</p>
+  </div>
+</footer>
+
+<script>
+const $=id=>document.getElementById(id);
+const SAMPLE="0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
+const NICE={log_wallet_age:"Wallet age",log_total_tx:"Activity volume",
+ log_erc20_tx:"Token transfer intensity",log_unique_tokens:"Token diversity",
+ log_counterparties:"Counterparty diversity",consistency:"Activity consistency",
+ stablecoin_ratio:"Stablecoin share",dormant_pre_window:"Dormant last 30d",
+ log_prior_borrows:"Prior Aave borrows",borrows_per_month:"Borrowing cadence",
+ log_days_since_borrow:"Time since last borrow",
+ never_borrowed_before:"First-time borrower",recent_borrow_burst:"Recent borrow burst"};
+
+fetch("/health").then(r=>r.json()).then(h=>{
+  $("modelmeta").textContent="logistic · trained on backtest labels";
+}).catch(()=>{$("modelmeta").textContent="api offline"});
+
+$("sample").onclick=()=>{$("wallet").value=SAMPLE};
+$("wallet").addEventListener("keydown",e=>{if(e.key==="Enter")go()});
+$("go").onclick=go;
+
+async function go(){
+  const w=$("wallet").value.trim();
+  $("err").style.display="none";$("res").classList.remove("show");
+  if(!/^0x[a-fA-F0-9]{40}$/.test(w)){return err("Enter a valid 0x… address (42 characters).")}
+  const b=$("go");b.disabled=true;b.textContent="Scoring…";
+  try{
+    const r=await fetch(`/score_model?wallet=${w}`);
+    const d=await r.json();
+    if(!r.ok){throw new Error(d.detail||`Request failed (${r.status})`)}
+    render(d);
+  }catch(e){err(e.message)}
+  finally{b.disabled=false;b.textContent="Score wallet"}
+}
+function err(m){$("err").textContent=m;$("err").style.display="block"}
+
+function render(d){
+  const p=d.risk_probability;
+  $("prob").textContent=(100*p).toFixed(1)+"%";
+  $("stamp").textContent=d.risk_tier+" RISK";
+  $("stamp").className="stamp "+d.risk_tier;
+  $("needle").style.left=(100*p).toFixed(1)+"%";
+  const maxC=Math.max(...d.drivers.map(x=>Math.abs(x.contribution)),0.001);
+  $("drv").innerHTML=d.drivers.map(x=>{
+    const wpct=(100*Math.abs(x.contribution)/maxC).toFixed(0);
+    const up=x.contribution>0;
+    return `<div class="drv"><span>${NICE[x.feature]||x.feature}</span>
+      <span class="bar"><i class="${up?"up":"down"}" style="${up?"left:50%":"right:50%"};width:${wpct/2}%"></i></span>
+      <span class="dir">${up?"+risk":"−risk"}</span></div>`}).join("");
+  const m=d.model||{};
+  $("fine").textContent=`Model: ${m.type} · CV AUC ${m.cv_auc?.toFixed(3)} on ${m.trained_on_rows} labeled borrowers · `
+    +`Task: ${m.task} · Aave borrow events found for this wallet: ${d.features?.aave_borrow_events_found ?? "—"} · `
+    +`Probabilities are case-control calibrated (see research note).`;
+  $("res").classList.add("show");
+}
+</script>
+</body>
+</html>
