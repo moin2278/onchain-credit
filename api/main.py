@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
+from api import store
 from api.features import compute_features
 from api.model_scoring import live_model_features, load_model, score_with_model
 from api.scoring import PROFILES, credit_decision, score_wallet
@@ -27,8 +28,14 @@ from api.trajectory import compute_trajectory
 app = FastAPI(
     title="On-Chain Credit Risk Scoring API",
     description="Explainable wallet risk + credit decisioning for DeFi lending.",
-    version="1.1.0",
+    version="1.2.0",
 )
+
+
+@app.on_event("startup")
+def _ensure_store_schema() -> None:
+    # Idempotent and guarded; no-op if DATABASE_URL is unset or DB unreachable.
+    store.init_schema()
 
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -116,17 +123,31 @@ def score_model(
     request: Request,
     wallet: str = Query(..., description="0x-prefixed Ethereum address"),
 ):
-    """Score with the TRAINED model from the published backtest (model.json)."""
+    """Score with the TRAINED model from the published backtest (model.json).
+
+    Served from the persistent store when a fresh score exists (instant);
+    otherwise computed live, saved write-through, and returned.
+    """
     model = load_model()
     if not model:
         raise HTTPException(status_code=503,
                             detail="model.json not deployed on this server.")
-    _check_rate_limit(request)
     w = _require_wallet(wallet)
+
+    cached = store.get_cached_score(w)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    # Cache miss -> live path. Rate-limit only the expensive branch so that
+    # instant cached/warm hits are never throttled.
+    _check_rate_limit(request)
     feats = live_model_features(w, _apikey())
     result = score_with_model(feats, model)
     result["wallet"] = w
     result["features"] = feats
+    result["cached"] = False
+    store.upsert_score(w, result, source="live")
     return result
 
 

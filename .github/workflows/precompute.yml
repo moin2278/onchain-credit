@@ -1,0 +1,26 @@
+name: Precompute wallet scores
+
+# Warms the Supabase score store so active Aave V3 borrowers score instantly.
+# Resumable + time-budgeted; safe to run on a schedule or on demand.
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"   # Mondays 07:17 UTC
+  workflow_dispatch:        # manual "Run workflow" button
+
+jobs:
+  precompute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run precompute batch
+        env:
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m backtest.precompute_scores --months 3 --limit 1500 --max-minutes 240
